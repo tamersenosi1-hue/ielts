@@ -1253,7 +1253,7 @@ const hex=u=>Array.from(u).map(x=>x.toString(16).padStart(2,'0')).join('');
 async function verifyCode(code){
   if(!(window.crypto&&crypto.subtle))return {ok:false,msg:'This browser cannot check codes here. Open the site with Chrome, Edge, Firefox or Safari from its web link or file.'};
   let b;try{b=b32dec(code)}catch(e){return {ok:false,msg:'That code is not valid. Check that you copied all of it.'}}
-  if(b.length<CODE_BYTES||b[0]!==1)return {ok:false,msg:'That code is not complete. Copy the whole code, including every group.'};
+  if(b.length<CODE_BYTES||(b[0]!==1&&b[0]!==2))return {ok:false,msg:'That code is not complete. Copy the whole code, including every group.'};
   let good=false;
   try{
     const key=await crypto.subtle.importKey('jwk',ACCESS.pub,{name:'ECDSA',namedCurve:'P-256'},false,['verify']);
@@ -1262,7 +1262,7 @@ async function verifyCode(code){
   if(!good)return {ok:false,msg:'That code is not valid. Check that you copied all of it.'};
   const dv=new DataView(b.buffer);
   const iat=(dv.getUint32(5)+CODE_EPOCH)*1000,exp=(dv.getUint32(9)+CODE_EPOCH)*1000;
-  return {ok:true,id:hex(b.slice(1,5)),iat,exp};
+  return {ok:true,id:hex(b.slice(1,5)),iat,exp,owner:b[0]===2};
 }
 async function revokeState(id){
   if(!ACCESS.revokeUrl)return {revoked:false,stale:false};
@@ -1278,7 +1278,22 @@ async function revokeState(id){
   let first=store.get('access-first',0);if(!first){first=Date.now();store.set('access-first',first)}
   return {revoked:false,stale:Date.now()-first>grace};
 }
+const OWN_PFX='OWNER-SESSION:';
+async function ownerHash(pw,saltHex){
+  const salt=new Uint8Array((saltHex.match(/../g)||[]).map(h=>parseInt(h,16)));
+  const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits']);
+  const bits=new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt,iterations:310000},k,256));
+  return Array.from(bits).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function ownerOk(){const n=Date.now();return {ok:true,owner:true,id:'owner',iat:n,exp:n+3153600000000,code:OWN_PFX+ACCESS.ownerHash}}
 async function checkSession(code){
+  if(ACCESS.ownerHash&&ACCESS.ownerSalt){
+    if(String(code).indexOf(OWN_PFX)===0)return String(code)===OWN_PFX+ACCESS.ownerHash?ownerOk():{ok:false,msg:'Please sign in again.'};
+    if(!/^\s*IELTS-/i.test(code)&&window.crypto&&crypto.subtle){
+      const h=await ownerHash(String(code).trim(),ACCESS.ownerSalt);
+      if(h===ACCESS.ownerHash)return ownerOk();
+    }
+  }
   const v=await verifyCode(code);if(!v.ok)return v;
   const now=Date.now(),seen=store.get('seen',0);
   if(now<seen-864e5)return {ok:false,msg:'Your device date looks wrong. Set the correct date and time, then sign in again.'};
@@ -1290,7 +1305,7 @@ async function checkSession(code){
   if(rs.stale)return {ok:false,msg:'Please connect to the internet once so your access can be checked.'};
   return Object.assign(v,{code});
 }
-function accessLeft(){if(!AUTH||AUTH.open)return '';const d=Math.max(0,Math.ceil((AUTH.exp-Date.now())/864e5));return d+(d===1?' day':' days')+' of access left'}
+function accessLeft(){if(!AUTH||AUTH.open)return '';if(AUTH.owner&&AUTH.id==='owner')return 'Owner access';const d=Math.max(0,Math.ceil((AUTH.exp-Date.now())/864e5));return d+(d===1?' day':' days')+' of access left'}
 function avatarHTML(cls){return `<span class="avatar ${cls||''}" aria-hidden="true">${PROFILE.photo?`<img alt="" src="${esc(PROFILE.photo)}">`:esc((PROFILE.name.replace(/^dr\.?\s*/i,'')||'T').charAt(0).toUpperCase())}</span>`}
 function renderSignIn(msg,prefill){
   document.body.style.overflow='';
@@ -1312,12 +1327,12 @@ function renderSignIn(msg,prefill){
   </div></main>`;
   const go_=async()=>{
     const code=$('#si-code').value;if(!code.trim()){$('#si-msg').textContent='Paste your access code first.';return}
-    if(ACCESS.reportUrl&&$('#si-ok')&&!$('#si-ok').checked){$('#si-msg').textContent='Please tick the box to continue.';return}
     const b=$('#si-go');b.disabled=true;b.textContent='Checking…';
     const r=await checkSession(code);
     if(!r.ok){b.disabled=false;b.textContent='Sign in';$('#si-msg').textContent=r.msg;return}
-    if(ACCESS.reportUrl)store.set('consent',1);
-    store.set('access',{code});const n=$('#si-name').value.trim();store.set('student',n);if(n&&S.cand&&!S.cand.name){S.cand.name=n;store.set('cand',S.cand)}
+    if(!r.owner&&ACCESS.reportUrl&&$('#si-ok')&&!$('#si-ok').checked){b.disabled=false;b.textContent='Sign in';$('#si-msg').textContent='Please tick the box to continue.';return}
+    if(ACCESS.reportUrl&&!r.owner)store.set('consent',1);
+    store.set('access',{code:r.owner?r.code:code});const n=$('#si-name').value.trim();store.set('student',n);if(n&&S.cand&&!S.cand.name){S.cand.name=n;store.set('cand',S.cand)}
     AUTH=r;try{history.replaceState(null,'',location.pathname+location.search+'#home')}catch(e){}
     reportVisit();route(true);
   };
@@ -1329,7 +1344,7 @@ async function accessInit(){
   const m=location.hash.match(/login=([^&]+)/);
   if(m){let c='';try{c=decodeURIComponent(m[1])}catch(e){c=m[1]}
     const r=await checkSession(c);
-    if(r.ok&&ACCESS.reportUrl&&!store.get('consent',0)){renderSignIn('Please read the notice below and tick the box to continue.',c);return false}
+    if(r.ok&&!r.owner&&ACCESS.reportUrl&&!store.get('consent',0)){renderSignIn('Please read the notice below and tick the box to continue.',c);return false}
     if(r.ok){store.set('access',{code:c});AUTH=r;reportVisit();try{history.replaceState(null,'',location.pathname+location.search+'#home')}catch(e){}return true}
     renderSignIn(r.msg,c);return false}
   const sv=store.get('access',null);
@@ -1343,7 +1358,7 @@ document.addEventListener('visibilitychange',async()=>{
 });
 
 /* ----- automatic progress reporting to the teacher (only scores, never texts or recordings) ----- */
-function reportEnabled(){return !!(ACCESS.reportUrl&&AUTH&&!AUTH.open&&AUTH.id&&store.get('consent',0))}
+function reportEnabled(){return !!(ACCESS.reportUrl&&AUTH&&!AUTH.open&&!AUTH.owner&&AUTH.id&&store.get('consent',0))}
 function reportPayload(type,rec){
   return {v:1,type,sid:AUTH.id,name:store.get('student','')||'',exp:AUTH.exp,at:Date.now(),
     rec:rec?{rid:AUTH.id+'-'+rec.at+'-'+String(rec.id||'').slice(0,24),at:rec.at,kind:rec.kind||'',id:rec.id||'',title:String(rec.title||rec.test||'').slice(0,80),sec:rec.sec||'',band:rec.band==null?null:rec.band,raw:rec.raw==null?null:rec.raw,total:rec.total==null?null:rec.total,words:Array.isArray(rec.words)?rec.words.join('/'):(rec.words||null),secs:rec.secs||null,assess:rec.assess?1:0,crit:Array.isArray(rec.crit)?rec.crit:null}:null};
